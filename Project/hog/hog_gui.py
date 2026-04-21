@@ -11,6 +11,7 @@ import dice
 import default_graphics
 
 PORT = 31415
+HOST = "0.0.0.0"
 DEFAULT_SERVER = "https://hog.cs61a.org"
 GUI_FOLDER = "gui_files/"
 PATHS = {}
@@ -153,4 +154,4 @@ def trace_play(play, strategy0, strategy1, update, score0, score1, dice, goal):
 
 
 if __name__ == "__main__" or "gunicorn" in os.environ.get("SERVER_SOFTWARE", ""):
-    app = start(PORT, DEFAULT_SERVER, GUI_FOLDER)
+    app = start(PORT, DEFAULT_SERVER, GUI_FOLDER, host=HOST)
