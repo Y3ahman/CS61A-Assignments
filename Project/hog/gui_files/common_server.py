@@ -35,6 +35,10 @@ def _run_initializers(initializers):
             initialize()
 
 
+def _safe_header_value(value):
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 def start(port, default_server, gui_folder, *initializers, host="127.0.0.1"):
     """Start a small local HTTP server for the GUI."""
     _run_initializers(initializers)
@@ -61,17 +65,15 @@ def start(port, default_server, gui_folder, *initializers, host="127.0.0.1"):
             if local_file.startswith(gui_root + os.sep) and os.path.isfile(local_file):
                 return self._write_file(local_file)
 
-            target = default_server.rstrip("/") + "/" + route_path
+            target = default_server.rstrip("/")
             self.send_response(HTTPStatus.FOUND)
-            self.send_header("Location", target.rstrip("/"))
+            self.send_header("Location", _safe_header_value(target))
             self.end_headers()
 
         def _payload(self, method, query):
             if method == "POST":
                 body_length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(body_length) if body_length else b"{}"
-                if not body.strip():
-                    return {}
                 try:
                     return json.loads(body)
                 except json.JSONDecodeError:
@@ -110,7 +112,10 @@ def start(port, default_server, gui_folder, *initializers, host="127.0.0.1"):
 
             content_type, _ = mimetypes.guess_type(path)
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type or "application/octet-stream")
+            self.send_header(
+                "Content-Type",
+                _safe_header_value(content_type or "application/octet-stream"),
+            )
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
