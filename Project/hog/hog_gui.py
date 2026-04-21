@@ -3,6 +3,8 @@
 import json
 import os
 import secrets
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -10,13 +12,15 @@ from urllib.parse import urlparse
 import dice
 import hog
 
-HOST = "0.0.0.0"
+HOST = os.environ.get("HOG_GUI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HOG_GUI_PORT", "31415"))
 
 GAME_STORE = {}
+GAME_LOCK = threading.Lock()
+GAME_TTL_SECONDS = int(os.environ.get("HOG_GUI_TTL_SECONDS", "21600"))
 
 INDEX_HTML = """<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -31,17 +35,17 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>Hog 游戏 GUI</h1>
+  <h1>Hog Game GUI</h1>
   <div class="card">
     <div class="row">
-      <label>目标分数 <input id="goal" type="number" min="20" max="500" value="100"></label>
-      <label>规则
+      <label>Goal score <input id="goal" type="number" min="20" max="500" value="100"></label>
+      <label>Rule
         <select id="rule">
           <option value="sus">Sus Fuss</option>
           <option value="simple">Simple</option>
         </select>
       </label>
-      <label>电脑策略
+      <label>Bot strategy
         <select id="bot">
           <option value="boar_strategy">boar_strategy</option>
           <option value="sus_strategy">sus_strategy</option>
@@ -49,17 +53,17 @@ INDEX_HTML = """<!doctype html>
           <option value="always_roll_5">always_roll_5</option>
         </select>
       </label>
-      <button id="newGame">新游戏</button>
+      <button id="newGame">New game</button>
     </div>
   </div>
 
   <div class="card">
-    <div class="score" id="score">你: 0 | 电脑: 0</div>
+    <div class="score" id="score">You: 0 | Bot: 0</div>
     <div class="row" style="margin-top:10px">
-      <label>你本回合掷骰数量(0-10) <input id="rolls" type="number" min="0" max="10" value="6"></label>
-      <button id="playTurn">进行回合</button>
+      <label>Your roll count (0-10) <input id="rolls" type="number" min="0" max="10" value="6"></label>
+      <button id="playTurn">Play turn</button>
     </div>
-    <p id="status">请先点击“新游戏”。</p>
+    <p id="status">Click "New game" to start.</p>
     <div class="log" id="log"></div>
   </div>
 
@@ -70,12 +74,12 @@ INDEX_HTML = """<!doctype html>
     const logEl = document.getElementById("log");
 
     function setState(s) {
-      scoreEl.textContent = `你: ${s.score0} | 电脑: ${s.score1}`;
+      scoreEl.textContent = `You: ${s.score0} | Bot: ${s.score1}`;
       if (s.over) {
-        const who = s.winner === 0 ? "你赢了 🎉" : "电脑赢了 🤖";
-        statusEl.textContent = `游戏结束：${who}`;
+        const who = s.winner === 0 ? "You win 🎉" : "Bot wins 🤖";
+        statusEl.textContent = `Game over: ${who}`;
       } else {
-        statusEl.textContent = "轮到你了";
+        statusEl.textContent = "Your turn";
       }
     }
 
@@ -96,16 +100,16 @@ INDEX_HTML = """<!doctype html>
           bot_strategy: document.getElementById("bot").value
         });
         gameId = data.game_id;
-        logEl.textContent = "新游戏已开始。";
+        logEl.textContent = "New game created.";
         setState(data.state);
       } catch (e) {
-        statusEl.textContent = "创建游戏失败: " + e.message;
+        statusEl.textContent = "Failed to create game: " + e.message;
       }
     };
 
     document.getElementById("playTurn").onclick = async () => {
       if (!gameId) {
-        statusEl.textContent = "请先创建新游戏。";
+        statusEl.textContent = "Please create a game first.";
         return;
       }
       try {
@@ -115,13 +119,13 @@ INDEX_HTML = """<!doctype html>
         });
         setState(data.state);
         const lines = [];
-        lines.push(`你选择掷 ${data.player.num_rolls} 个骰子，得分 +${data.player.gained}，总分 ${data.player.score}`);
+        lines.push(`You rolled ${data.player.num_rolls} dice, gained +${data.player.gained}, total ${data.player.score}`);
         if (data.bot) {
-          lines.push(`电脑选择掷 ${data.bot.num_rolls} 个骰子，得分 +${data.bot.gained}，总分 ${data.bot.score}`);
+          lines.push(`Bot rolled ${data.bot.num_rolls} dice, gained +${data.bot.gained}, total ${data.bot.score}`);
         }
         logEl.textContent = lines.join("\\n");
       } catch (e) {
-        statusEl.textContent = "回合执行失败: " + e.message;
+        statusEl.textContent = "Turn failed: " + e.message;
       }
     };
   </script>
@@ -167,6 +171,12 @@ def _strategy_map():
         "final_strategy": hog.final_strategy,
         "always_roll_5": hog.always_roll_5,
     }
+
+
+def _prune_games(now_ts):
+    expired = [gid for gid, state in GAME_STORE.items() if now_ts - state["updated_at"] > GAME_TTL_SECONDS]
+    for gid in expired:
+        del GAME_STORE[gid]
 
 
 class HogGuiHandler(BaseHTTPRequestHandler):
@@ -215,26 +225,27 @@ class HogGuiHandler(BaseHTTPRequestHandler):
             _text_response(self, "unsupported bot_strategy", HTTPStatus.BAD_REQUEST)
             return
 
+        now_ts = time.time()
         game_id = secrets.token_hex(16)
-        GAME_STORE[game_id] = {
-            "score0": 0,
-            "score1": 0,
-            "goal": goal,
-            "use_sus": use_sus,
-            "bot_strategy": bot_strategy,
-            "over": False,
-            "winner": None,
-        }
-        _json_response(self, {"game_id": game_id, "state": _state_view(GAME_STORE[game_id])})
+        with GAME_LOCK:
+            _prune_games(now_ts)
+            GAME_STORE[game_id] = {
+                "score0": 0,
+                "score1": 0,
+                "goal": goal,
+                "use_sus": use_sus,
+                "bot_strategy": bot_strategy,
+                "over": False,
+                "winner": None,
+                "updated_at": now_ts,
+            }
+            state_view = _state_view(GAME_STORE[game_id])
+        _json_response(self, {"game_id": game_id, "state": state_view})
 
     def _player_turn(self, data):
         game_id = data.get("game_id")
-        if not game_id or game_id not in GAME_STORE:
+        if not game_id:
             _text_response(self, "invalid game_id", HTTPStatus.BAD_REQUEST)
-            return
-        state = GAME_STORE[game_id]
-        if state["over"]:
-            _json_response(self, {"state": _state_view(state), "player": None, "bot": None})
             return
 
         num_rolls = data.get("num_rolls")
@@ -242,39 +253,47 @@ class HogGuiHandler(BaseHTTPRequestHandler):
             _text_response(self, "num_rolls must be an integer in [0, 10]", HTTPStatus.BAD_REQUEST)
             return
 
-        update = hog.sus_update if state["use_sus"] else hog.simple_update
+        now_ts = time.time()
+        with GAME_LOCK:
+            _prune_games(now_ts)
+            state = GAME_STORE.get(game_id)
+            if state is None:
+                _text_response(self, "invalid game_id", HTTPStatus.BAD_REQUEST)
+                return
+            if state["over"]:
+                _json_response(self, {"state": _state_view(state), "player": None, "bot": None})
+                return
 
-        old0 = state["score0"]
-        state["score0"] = update(num_rolls, state["score0"], state["score1"], dice.six_sided)
-        player_event = {
-            "num_rolls": num_rolls,
-            "gained": state["score0"] - old0,
-            "score": state["score0"],
-        }
-        if state["score0"] >= state["goal"]:
-            state["over"] = True
-            state["winner"] = 0
-            _json_response(self, {"state": _state_view(state), "player": player_event, "bot": None})
-            return
+            update = hog.sus_update if state["use_sus"] else hog.simple_update
 
-        bot_func = _strategy_map()[state["bot_strategy"]]
-        bot_rolls = bot_func(state["score1"], state["score0"])
-        old1 = state["score1"]
-        state["score1"] = update(bot_rolls, state["score1"], state["score0"], dice.six_sided)
-        bot_event = {
-            "num_rolls": bot_rolls,
-            "gained": state["score1"] - old1,
-            "score": state["score1"],
-        }
-        if state["score1"] >= state["goal"]:
-            state["over"] = True
-            state["winner"] = 1
+            old0 = state["score0"]
+            state["score0"] = update(num_rolls, state["score0"], state["score1"], dice.six_sided)
+            player_event = {
+                "num_rolls": num_rolls,
+                "gained": state["score0"] - old0,
+                "score": state["score0"],
+            }
+            if state["score0"] >= state["goal"]:
+                state["over"] = True
+                state["winner"] = 0
+                state["updated_at"] = now_ts
+                _json_response(self, {"state": _state_view(state), "player": player_event, "bot": None})
+                return
 
-        _json_response(self, {"state": _state_view(state), "player": player_event, "bot": bot_event})
-
-    def log_message(self, format_str, *args):
-        return
-
+            bot_func = _strategy_map()[state["bot_strategy"]]
+            bot_rolls = bot_func(state["score1"], state["score0"])
+            old1 = state["score1"]
+            state["score1"] = update(bot_rolls, state["score1"], state["score0"], dice.six_sided)
+            bot_event = {
+                "num_rolls": bot_rolls,
+                "gained": state["score1"] - old1,
+                "score": state["score1"],
+            }
+            if state["score1"] >= state["goal"]:
+                state["over"] = True
+                state["winner"] = 1
+            state["updated_at"] = now_ts
+            _json_response(self, {"state": _state_view(state), "player": player_event, "bot": bot_event})
 
 def main():
     server = ThreadingHTTPServer((HOST, PORT), HogGuiHandler)
